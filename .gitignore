@@ -11,6 +11,7 @@ _build/
 scripts/.coursier
 scripts/.scalafmt*
 scripts/.scala-cli*
+scripts/gc-bench-matrix.log
 sbt-crossproject/
 sbt-launch.jar
 local.sbt
