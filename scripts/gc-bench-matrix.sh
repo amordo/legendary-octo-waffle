@@ -11,11 +11,12 @@
 #   scripts/gc-bench-matrix.sh immix "1 8" 5 arena      # off-heap arena only
 #
 # Modes: 'heap' (GC-managed nodes), 'arena' (per-thread off-heap bump arena
-# with explicit reset) and 'arenaStruct' (the same arena written naively with
-# CStruct-typed pointers, which allocates Tags on the GC heap). 'arena' is the
-# GC-free reference point; the 'none' GC is not, since it never reuses memory.
-# Under 'arena' the GC axis only affects incidental runtime allocations, so a
-# single GC is usually enough.
+# with explicit reset), 'zone' (the same regions via unsafe.Zone, whose pages
+# come from one process-wide synchronized pool) and 'arenaStruct' (the arena
+# written naively with CStruct-typed pointers, which allocates Tags on the GC
+# heap). 'arena' is the GC-free reference point; the 'none' GC is not, since it
+# never reuses memory. Under the off-heap modes the GC axis only affects
+# incidental runtime allocations, so a single GC is usually enough.
 #
 # This build overrides the repo-wide nativeConfig from project/MyScalaNativePlugin.scala,
 # which forces check/checkFatalWarnings/dump and full source-level debugging on
@@ -48,7 +49,7 @@ LOG_FILE="scripts/gc-bench-matrix.log"
 PERF_CONFIG='.withCheck(false).withCheckFatalWarnings(false).withSourceLevelDebuggingConfig(_.disableAll).withLTO(scala.scalanative.build.LTO.thin).withDump(false)'
 
 if [[ ! -f "$RESULTS_FILE" ]]; then
-  echo "mode,gc,threads,chainLen,elapsedSec,allocations,allocPerSec,nodeBytes,bytesPerSec,gcCollections,gcTimeMs,gcTimeShare" > "$RESULTS_FILE"
+  echo "mode,gc,threads,chainLen,elapsedSec,allocations,allocPerSec,nodeBytes,bytesPerSec,gcCollections,gcTimeMs,gcTimeShare,rssPeakBytes,rssGrowthBytes,gcHeapUsedBytes,gcHeapMaxBytes" > "$RESULTS_FILE"
 fi
 
 : > "$LOG_FILE"
@@ -89,24 +90,23 @@ for gc in $GCS; do
     rm -f "$TMP_OUT"
 
     if [[ $timed_out -eq 1 ]]; then
-      echo "$mode,$gc,$threads,$chainLen,TIMEOUT,,,,,,," >> "$RESULTS_FILE"
+      echo "$mode,$gc,$threads,$chainLen,TIMEOUT,,,,,,,,,,," >> "$RESULTS_FILE"
       continue
     fi
 
     LINE=$(echo "$OUTPUT" | grep -E '^mode=' || true)
     if [[ -z "$LINE" ]]; then
       echo "!! No benchmark output found for mode=$mode gc=$gc threads=$threads chainLen=$chainLen, see $LOG_FILE" >&2
-      echo "$mode,$gc,$threads,$chainLen,ERROR,,,,,,," >> "$RESULTS_FILE"
+      echo "$mode,$gc,$threads,$chainLen,ERROR,,,,,,,,,,," >> "$RESULTS_FILE"
       continue
     fi
 
-    # parse "mode=M threads=T chainLen=L elapsedSec=E allocations=A
-    # allocPerSec=P nodeBytes=B bytesPerSec=BS gcCollections=C gcTimeMs=T
-    # gcTimeShare=S sink=X"
+    # parse the single "key=value ..." summary line the benchmark prints
     # (plain vars, not associative arrays: macOS ships bash 3.2)
     v_threads=""; v_chainLen=""; v_elapsedSec=""; v_allocations=""; v_allocPerSec=""
     v_nodeBytes=""; v_bytesPerSec=""
     v_gcCollections=""; v_gcTimeMs=""; v_gcTimeShare=""
+    v_rssPeakBytes=""; v_rssGrowthBytes=""; v_gcHeapUsedBytes=""; v_gcHeapMaxBytes=""
     for pair in $LINE; do
       key="${pair%%=*}"
       val="${pair#*=}"
@@ -121,10 +121,14 @@ for gc in $GCS; do
         gcCollections) v_gcCollections="$val" ;;
         gcTimeMs) v_gcTimeMs="$val" ;;
         gcTimeShare) v_gcTimeShare="$val" ;;
+        rssPeakBytes) v_rssPeakBytes="$val" ;;
+        rssGrowthBytes) v_rssGrowthBytes="$val" ;;
+        gcHeapUsedBytes) v_gcHeapUsedBytes="$val" ;;
+        gcHeapMaxBytes) v_gcHeapMaxBytes="$val" ;;
       esac
     done
 
-    echo "$mode,$gc,$v_threads,$v_chainLen,$v_elapsedSec,$v_allocations,$v_allocPerSec,$v_nodeBytes,$v_bytesPerSec,$v_gcCollections,$v_gcTimeMs,$v_gcTimeShare" >> "$RESULTS_FILE"
+    echo "$mode,$gc,$v_threads,$v_chainLen,$v_elapsedSec,$v_allocations,$v_allocPerSec,$v_nodeBytes,$v_bytesPerSec,$v_gcCollections,$v_gcTimeMs,$v_gcTimeShare,$v_rssPeakBytes,$v_rssGrowthBytes,$v_gcHeapUsedBytes,$v_gcHeapMaxBytes" >> "$RESULTS_FILE"
   done
   done
 done
