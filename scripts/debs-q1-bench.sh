@@ -9,12 +9,16 @@
 #   DEBS_FILE=~/data/debs2015.csv scripts/debs-q1-bench.sh
 #   DEBS_FILE=~/data/debs2015.csv scripts/debs-q1-bench.sh offheap immix 200000
 #
-# Modes: 'heap' (LongMap of route objects, one event object per trip) and
-# 'offheap' (the same graph flattened into malloc'd primitive arrays). Both run
-# the same algorithm over the same raw-byte reader, so the only variable is how
-# the operator state is represented. Under 'offheap' the GC axis only affects
-# incidental runtime allocations -- gcCollections is expected to be 0 there, and
-# a non-zero value means something on the path started allocating again.
+# Modes: 'heap' (LongMap of route objects, one event object per trip),
+# 'offheap' (the same graph flattened into malloc'd primitive arrays) and
+# 'zone' (the same operator on unsafe.Zone regions: the window cut into panes
+# released as whole regions, the route table in a zone open for the run). All
+# three run the same algorithm over the same raw-byte reader, so the only
+# variable is how the operator state is represented. Under 'offheap' the GC axis
+# only affects incidental runtime allocations -- gcCollections is expected to be
+# 0 there, and a non-zero value means something on the path started allocating
+# again. 'zone' does collect: Zone.alloc and typed struct access both allocate
+# on the GC heap in Scala Native 0.5, which is what that mode measures.
 #
 # The data file is not redistributable; download it from
 # https://debs.org/grand-challenges/2015/ (20-day extract ~130 MB, full year
@@ -27,7 +31,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MODES="${1:-heap offheap}"
+MODES="${1:-heap offheap zone}"
 GCS="${2:-immix}"
 LIMIT="${3:-0}"
 RUN_TIMEOUT_SEC="${RUN_TIMEOUT_SEC:-900}"

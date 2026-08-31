@@ -19,7 +19,7 @@ import scala.scalanative.unsigned._
  *  its order changes, including when a change is caused by events leaving the
  *  window. Ties are broken by freshness, as the challenge FAQ requires.
  *
- *  What varies between the two BENCH_MODEs is only how the operator state is
+ *  What varies between the three BENCH_MODEs is only how the operator state is
  *  represented; the algorithm, the reader and the output formatter are shared:
  *
  *    - `heap` : a `mutable.LongMap` of `RouteEntry` objects and a window of
@@ -28,16 +28,22 @@ import scala.scalanative.unsigned._
  *    - `offheap` : the same graph flattened into malloc'd primitive arrays
  *      addressed by integer indices. Nothing is allocated on the GC heap inside
  *      the loop, so `gcCollections` must come out as 0.
+ *    - `zone` : the same operator built on `unsafe.Zone` regions instead of
+ *      `malloc` -- the window cut into panes that are released as whole regions
+ *      and the route table in a zone open for the run. This is the region
+ *      program the library invites you to write, and it says what that costs
+ *      today; it is an independent implementation rather than `offheap` with an
+ *      allocation bolted on, so it is the mode that answers the question.
  *
- *  I/O is held constant on purpose: both modes read through the same raw byte
- *  reader and parse straight from the buffer without materialising Strings.
+ *  I/O is held constant on purpose: every mode reads through the same raw byte
+ *  reader and parses straight from the buffer without materialising Strings.
  *  Otherwise the String garbage produced by an idiomatic line reader would
  *  dominate everything else and the measurement would be about `readLine`.
  *
- *  Both modes keep routes whose count has fallen to zero, so the number of live
- *  entries is the number of distinct routes ever seen rather than the number
- *  currently in the window. This is what the open-addressed table needs (it has
- *  no deletion) and it is applied to the heap mode as well to keep the two
+ *  Every mode keeps routes whose count has fallen to zero, so the number of
+ *  live entries is the number of distinct routes ever seen rather than the
+ *  number currently in the window. This is what the open-addressed table needs
+ *  (it has no deletion) and it is applied to the heap mode as well to keep them
  *  comparable; a production heap implementation would drop them.
  *
  *  Latency follows the challenge definition: the clock starts when a line
@@ -794,6 +800,336 @@ object DebsQ1Bench {
     }
   }
 
+  /** One trip in the window: drop-off second, route entry index, next record.
+   *  The link is `Ptr[Byte]` because a struct cannot mention itself.
+   */
+  private type TripRec = CStruct3[Int, Int, Ptr[Byte]]
+
+  /** A slice of the window that owns its region. Panes are cut on arrival
+   *  count, not on time, so the oldest pane is always the one that drains first
+   *  no matter how the drop-off times are ordered in the file.
+   */
+  private final class ZonePane(val zone: Zone) {
+    var allocated = 0
+    var expired = 0
+    var next: ZonePane = null
+  }
+
+  /** The same operator written against `unsafe.Zone` instead of `malloc`, the
+   *  way a Scala Native program that wants regions would actually be written.
+   *
+   *  The window is the part with region-shaped lifetime, so it is cut into
+   *  panes of `PaneTrips` consecutive arrivals; each pane opens a zone, trips
+   *  are allocated one record at a time inside it, and the whole zone is closed
+   *  in one call once its last record has left the window. Expiry itself stays
+   *  exact and per event -- the regions only decide when the memory goes back,
+   *  which is what a region allocator is for.
+   *
+   *  The route table cannot be paned: any route may be touched again
+   *  arbitrarily far in the future, so its arrays live in a single zone that
+   *  stays open for the whole run. A zone has no `realloc` and no per-object
+   *  free, so growing one of them allocates a larger copy in the zone and
+   *  abandons the old one until the run ends -- that is the price of the region
+   *  model, and it is left in rather than worked around.
+   *
+   *  This mode deliberately differs from `offheap` in two ways at once, because
+   *  writing it idiomatically forces both: `Zone.alloc` per trip, and the `Tag`
+   *  and `Ptr` objects that typed struct access materialises. Both land on the
+   *  GC heap in Scala Native 0.5, so unlike `offheap` this mode does collect.
+   *  GcPauseBench measures the two costs separately on a synthetic workload;
+   *  here the question is only what they add up to on a real one.
+   */
+  private final class ZoneQ1 extends Q1State {
+    private final val PaneTrips = 1 << 16
+
+    private val stateZone: Zone = Zone.open()
+
+    private def longs(n: Int): Ptr[Long] = {
+      implicit val z: Zone = stateZone
+      alloc[Long](n)
+    }
+
+    private def ints(n: Int): Ptr[Int] = {
+      implicit val z: Zone = stateZone
+      alloc[Int](n)
+    }
+
+    private def newTrip(pane: ZonePane): Ptr[TripRec] = {
+      implicit val z: Zone = pane.zone
+      alloc[TripRec]()
+    }
+
+    private def fillInt(
+        p: Ptr[Int],
+        from: Int,
+        until: Int,
+        v: Int
+    ): Ptr[Int] = {
+      var i = from
+      while (i < until) { p(i) = v; i += 1 }
+      p
+    }
+
+    private var entryCap = 1 << 16
+    private var entryCount = 0
+    private var eKey = longs(entryCap)
+    private var eSeq = longs(entryCap)
+    private var eCnt = ints(entryCap)
+    private var ePrev = ints(entryCap)
+    private var eNext = ints(entryCap)
+
+    // open-addressed routeId -> entry index + 1; zone memory arrives zeroed,
+    // which is exactly the empty marker
+    private var idxCap = 1 << 17
+    private var idxMask = idxCap - 1
+    private var index = ints(idxCap)
+
+    private var bucketCap = 1024
+    private var bucketHead = fillInt(ints(bucketCap), 0, bucketCap, -1)
+    private var maxCount = 0
+
+    private val top = ints(TopK)
+    private val prevTop = longs(TopK)
+    private var len = 0
+
+    private var paneHead: ZonePane = null
+    private var paneTail: ZonePane = null
+    private var winHead: Ptr[TripRec] = null
+    private var winTail: Ptr[TripRec] = null
+    private var size = 0
+
+    def topLen: Int = len
+    def topRoute(i: Int): Long = eKey(top(i))
+    def distinctRoutes: Int = entryCount
+    def windowSize: Int = size
+
+    def close(): Unit = {
+      var pane = paneHead
+      while (pane != null) {
+        pane.zone.close()
+        pane = pane.next
+      }
+      paneHead = null
+      paneTail = null
+      stateZone.close()
+    }
+
+    private def hashOf(key: Long): Int = {
+      var h = key * 0x9e3779b97f4a7c15L
+      h ^= h >>> 32
+      h.toInt & idxMask
+    }
+
+    private def grownLongs(src: Ptr[Long], n: Int, cap: Int): Ptr[Long] = {
+      val dst = longs(cap)
+      var i = 0
+      while (i < n) { dst(i) = src(i); i += 1 }
+      dst
+    }
+
+    private def grownInts(src: Ptr[Int], n: Int, cap: Int): Ptr[Int] = {
+      val dst = ints(cap)
+      var i = 0
+      while (i < n) { dst(i) = src(i); i += 1 }
+      dst
+    }
+
+    private def rehash(): Unit = {
+      idxCap <<= 1
+      idxMask = idxCap - 1
+      index = ints(idxCap)
+      var e = 0
+      while (e < entryCount) {
+        var i = hashOf(eKey(e))
+        while (index(i) != 0) i = (i + 1) & idxMask
+        index(i) = e + 1
+        e += 1
+      }
+    }
+
+    private def growEntries(): Unit = {
+      val old = entryCap
+      entryCap <<= 1
+      eKey = grownLongs(eKey, old, entryCap)
+      eSeq = grownLongs(eSeq, old, entryCap)
+      eCnt = grownInts(eCnt, old, entryCap)
+      ePrev = grownInts(ePrev, old, entryCap)
+      eNext = grownInts(eNext, old, entryCap)
+    }
+
+    private def entryFor(key: Long): Int = {
+      var i = hashOf(key)
+      var v = index(i)
+      while (v != 0 && eKey(v - 1) != key) {
+        i = (i + 1) & idxMask
+        v = index(i)
+      }
+      if (v != 0) v - 1
+      else {
+        if (entryCount == entryCap) growEntries()
+        val e = entryCount
+        entryCount += 1
+        eKey(e) = key
+        eSeq(e) = 0L
+        eCnt(e) = 0
+        ePrev(e) = -1
+        eNext(e) = -1
+        index(i) = e + 1
+        if (entryCount * 10 >= idxCap * 6) rehash()
+        e
+      }
+    }
+
+    private def better(a: Int, b: Int): Boolean =
+      eCnt(a) > eCnt(b) || (eCnt(a) == eCnt(b) && eSeq(a) > eSeq(b))
+
+    private def bubbleUp(from: Int): Int = {
+      var i = from
+      while (i > 0 && better(top(i), top(i - 1))) {
+        val t = top(i); top(i) = top(i - 1); top(i - 1) = t
+        i -= 1
+      }
+      i
+    }
+
+    private def link(e: Int, c: Int): Unit = {
+      if (c >= bucketCap) {
+        val grown = Math.max(c + 1, bucketCap * 2)
+        bucketHead = fillInt(
+          grownInts(bucketHead, bucketCap, grown),
+          bucketCap,
+          grown,
+          -1
+        )
+        bucketCap = grown
+      }
+      ePrev(e) = -1
+      eNext(e) = bucketHead(c)
+      if (bucketHead(c) >= 0) ePrev(bucketHead(c)) = e
+      bucketHead(c) = e
+    }
+
+    private def unlink(e: Int, c: Int): Unit = {
+      if (ePrev(e) >= 0) eNext(ePrev(e)) = eNext(e)
+      else bucketHead(c) = eNext(e)
+      if (eNext(e) >= 0) ePrev(eNext(e)) = ePrev(e)
+      ePrev(e) = -1
+      eNext(e) = -1
+    }
+
+    private def indexInTop(e: Int): Int = {
+      var i = 0
+      var found = -1
+      while (i < len) {
+        if (top(i) == e) found = i
+        i += 1
+      }
+      found
+    }
+
+    private def offer(e: Int): Unit = {
+      if (len < TopK) {
+        top(len) = e
+        len += 1
+        bubbleUp(len - 1)
+        ()
+      } else if (better(e, top(TopK - 1))) {
+        top(TopK - 1) = e
+        bubbleUp(TopK - 1)
+        ()
+      }
+    }
+
+    private def rebuild(): Boolean = {
+      var i = 0
+      while (i < len) { prevTop(i) = eKey(top(i)); i += 1 }
+      val prevLen = len
+      len = 0
+      while (maxCount > 0 && bucketHead(maxCount) < 0) maxCount -= 1
+      var c = maxCount
+      while (c > 0 && len < TopK) {
+        var e = bucketHead(c)
+        while (e >= 0) { offer(e); e = eNext(e) }
+        c -= 1
+      }
+      if (len != prevLen) true
+      else {
+        var changed = false
+        var k = 0
+        while (k < len) {
+          if (eKey(top(k)) != prevTop(k)) changed = true
+          k += 1
+        }
+        changed
+      }
+    }
+
+    def add(routeId: Long, dropoffSec: Int, seq: Long): Boolean = {
+      val e = entryFor(routeId)
+      val old = eCnt(e)
+      if (old > 0) unlink(e, old)
+      eCnt(e) = old + 1
+      eSeq(e) = seq
+      link(e, old + 1)
+      if (old + 1 > maxCount) maxCount = old + 1
+
+      if (paneTail == null || paneTail.allocated == PaneTrips) {
+        val pane = new ZonePane(Zone.open())
+        if (paneTail == null) paneHead = pane else paneTail.next = pane
+        paneTail = pane
+      }
+      val trip = newTrip(paneTail)
+      paneTail.allocated += 1
+      trip._1 = dropoffSec
+      trip._2 = e
+      // _3 stays null, zone allocations come back zeroed
+      if (winTail == null) winHead = trip
+      else winTail._3 = trip.asInstanceOf[Ptr[Byte]]
+      winTail = trip
+      size += 1
+
+      val idx = indexInTop(e)
+      if (idx >= 0) bubbleUp(idx) != idx
+      else if (len < TopK) { offer(e); true }
+      else if (better(e, top(TopK - 1))) { offer(e); true }
+      else false
+    }
+
+    def expire(limitSec: Int): Int = {
+      var changedAt = Int.MinValue
+      var go = size > 0
+      while (go) {
+        val trip = winHead
+        val drop = trip._1
+        if (drop > limitSec) go = false
+        else {
+          val e = trip._2
+          val next = trip._3.asInstanceOf[Ptr[TripRec]]
+          winHead = next
+          if (next == null) winTail = null
+          size -= 1
+          // release drained panes before charging this record, otherwise the
+          // count of a pane that filled up and emptied without a successor
+          // would run past its size and it would never be released
+          while (paneHead.expired == paneHead.allocated &&
+              paneHead.next != null) {
+            val done = paneHead
+            paneHead = done.next
+            done.zone.close()
+          }
+          paneHead.expired += 1
+          val cnt = eCnt(e)
+          unlink(e, cnt)
+          eCnt(e) = cnt - 1
+          if (cnt - 1 > 0) link(e, cnt - 1)
+          if (indexInTop(e) >= 0 && rebuild()) changedAt = drop
+          go = size > 0
+        }
+      }
+      changedAt
+    }
+  }
+
   // -------------------------------------------------------------- rendering
 
   private val outBuf: Ptr[Byte] = malloc(1024.toUSize)
@@ -950,8 +1286,8 @@ object DebsQ1Bench {
     )
     val mode = Option(System.getenv("BENCH_MODE")).getOrElse("heap")
     require(
-      mode == "heap" || mode == "offheap",
-      s"BENCH_MODE must be heap or offheap, got '$mode'"
+      mode == "heap" || mode == "offheap" || mode == "zone",
+      s"BENCH_MODE must be heap, offheap or zone, got '$mode'"
     )
     val limit = Option(System.getenv("BENCH_LIMIT")).fold(0L)(_.toLong)
     val bufKb = Option(System.getenv("BENCH_BUF_KB")).fold(1024)(_.toInt)
@@ -963,7 +1299,10 @@ object DebsQ1Bench {
     if (outPath.nonEmpty)
       outFile = Zone.acquire { implicit z => fopen(toCString(outPath), c"wb") }
 
-    val state: Q1State = if (mode == "offheap") new OffHeapQ1 else new HeapQ1
+    val state: Q1State =
+      if (mode == "offheap") new OffHeapQ1
+      else if (mode == "zone") new ZoneQ1
+      else new HeapQ1
     val reader = new LineReader(path, bufKb * 1024)
 
     var events = 0L
