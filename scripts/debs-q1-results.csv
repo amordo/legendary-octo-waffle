@@ -1,0 +1,1 @@
+mode,gc,events,outliers,malformed,bytes,elapsedSec,eventsPerSec,bytesPerSec,outputs,distinctRoutes,windowSize,delaySamples,delayMeanNs,delayP50Ns,delayP99Ns,delayP999Ns,delayMaxNs,gcCollections,gcTimeMs,gcTimeShare,rssPeakBytes,rssGrowthBytes,gcHeapUsedBytes,gcHeapMaxBytes
