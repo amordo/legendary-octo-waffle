@@ -48,8 +48,13 @@ LOG_FILE="scripts/gc-bench-matrix.log"
 
 PERF_CONFIG='.withCheck(false).withCheckFatalWarnings(false).withSourceLevelDebuggingConfig(_.disableAll).withLTO(scala.scalanative.build.LTO.thin).withDump(false)'
 
-if [[ ! -f "$RESULTS_FILE" ]]; then
-  echo "mode,gc,threads,chainLen,elapsedSec,allocations,allocPerSec,nodeBytes,bytesPerSec,gcCollections,gcTimeMs,gcTimeShare,rssPeakBytes,rssGrowthBytes,gcHeapUsedBytes,gcHeapMaxBytes" > "$RESULTS_FILE"
+CSV_HEADER="mode,gc,threads,chainLen,elapsedSec,allocations,allocPerSec,nodeBytes,bytesPerSec,gcCollections,gcTimeMs,gcTimeShare,rssPeakBytes,rssGrowthBytes,gcHeapUsedBytes,gcHeapMaxBytes"
+# Checked by content, not just existence: a file left over from an older
+# schema (or with the header row lost some other way) would otherwise never
+# get one prepended.
+if [[ "$(head -n1 "$RESULTS_FILE" 2>/dev/null)" != "$CSV_HEADER" ]]; then
+  { echo "$CSV_HEADER"; cat "$RESULTS_FILE" 2>/dev/null; } > "$RESULTS_FILE.tmp"
+  mv "$RESULTS_FILE.tmp" "$RESULTS_FILE"
 fi
 
 : > "$LOG_FILE"
